@@ -1,6 +1,7 @@
 package com.ethan.voxyworldgenv2.network;
 
 import com.ethan.voxyworldgenv2.VoxyWorldGenV2;
+import com.ethan.voxyworldgenv2.core.Config;
 import com.ethan.voxyworldgenv2.core.PlayerTracker;
 
 import io.netty.buffer.ByteBuf;
@@ -22,13 +23,25 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class NetworkHandler {
     public static final ResourceLocation HANDSHAKE_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "handshake"));
     public static final ResourceLocation LOD_DATA_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "lod_data"));
+    public static final ResourceLocation CLIENT_READY_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "client_ready"));
+    public static final ResourceLocation LOD_ACK_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "lod_ack"));
 
     // keep individual packets well under Netty's 2MB limit to prevent connection resets on public servers
     private static final int MAX_PACKET_BYTES = 32_768;
+    private static final long DEBUG_LOG_INTERVAL_MS = 5_000L;
+    private static final AtomicLong debugPayloadsSent = new AtomicLong();
+    private static final AtomicLong debugSectionsSent = new AtomicLong();
+    private static final AtomicLong debugBytesSent = new AtomicLong();
+    private static final AtomicLong debugAcksReceived = new AtomicLong();
+    private static final AtomicLong debugReadyReceived = new AtomicLong();
+    private static final AtomicLong debugThrottled = new AtomicLong();
+    private static final AtomicLong debugNotReady = new AtomicLong();
+    private static volatile long nextDebugLogAtMs = 0L;
 
     public record HandshakePayload(boolean serverHasMod) {
         public HandshakePayload(FriendlyByteBuf buf) {
@@ -80,19 +93,76 @@ public class NetworkHandler {
 
     }
 
-    public static void init() {
-        VoxyWorldGenV2.LOGGER.info("voxy networking initialized");
+    public record ClientReadyPayload(ResourceKey<Level> dimension) {
+        public ClientReadyPayload(FriendlyByteBuf buf) {
+            this(ResourceKey.create(Registries.DIMENSION, Objects.requireNonNull(ResourceLocation.tryParse(buf.readUtf()), "invalid dimension resource location in ready payload")));
+        }
+
+        public void write(FriendlyByteBuf buf) {
+            buf.writeUtf(dimension.location().toString());
+        }
     }
 
-    private static void setSyncedState(ServerPlayer player, ChunkPos pos, boolean isSynced) {
-        var synced = PlayerTracker.getInstance().getSyncedChunks(player.getUUID());
-        if (synced != null) {
-            if (isSynced) {
-                synced.add(pos.toLong());
-            } else {
-                synced.remove(pos.toLong());
-            }
+    public record LODAckPayload(ResourceKey<Level> dimension, ChunkPos pos) {
+        public LODAckPayload(FriendlyByteBuf buf) {
+            this(
+                ResourceKey.create(Registries.DIMENSION, Objects.requireNonNull(ResourceLocation.tryParse(buf.readUtf()), "invalid dimension resource location in ack payload")),
+                buf.readChunkPos()
+            );
         }
+
+        public void write(FriendlyByteBuf buf) {
+            buf.writeUtf(dimension.location().toString());
+            buf.writeChunkPos(pos);
+        }
+    }
+
+    public record SendResult(boolean sent, boolean throttled, boolean notReady, long bytes) {
+        public static SendResult sent(long bytes) {
+            return new SendResult(true, false, false, bytes);
+        }
+
+        public static SendResult throttled(long bytes) {
+            return new SendResult(false, true, false, bytes);
+        }
+
+        public static SendResult notReadyResult() {
+            return new SendResult(false, false, true, 0L);
+        }
+
+        public static SendResult empty() {
+            return new SendResult(false, false, false, 0L);
+        }
+    }
+
+    public static void init() {
+        ServerPlayNetworking.registerGlobalReceiver(CLIENT_READY_ID, (server, player, handler, buf, responseSender) -> {
+            try {
+                ClientReadyPayload payload = new ClientReadyPayload(buf);
+                server.execute(() -> {
+                    PlayerTracker.getInstance().markClientReady(player.getUUID(), payload.dimension());
+                    debugReadyReceived.incrementAndGet();
+                    recordDebugPayload(null, 0);
+                });
+            } catch (Exception e) {
+                VoxyWorldGenV2.LOGGER.error("failed to decode client ready payload", e);
+            }
+        });
+
+        ServerPlayNetworking.registerGlobalReceiver(LOD_ACK_ID, (server, player, handler, buf, responseSender) -> {
+            try {
+                LODAckPayload payload = new LODAckPayload(buf);
+                server.execute(() -> {
+                    PlayerTracker.getInstance().markLodAck(player.getUUID(), payload.dimension(), payload.pos());
+                    debugAcksReceived.incrementAndGet();
+                    recordDebugPayload(null, 0);
+                });
+            } catch (Exception e) {
+                VoxyWorldGenV2.LOGGER.error("failed to decode LOD ack payload", e);
+            }
+        });
+
+        VoxyWorldGenV2.LOGGER.info("voxy networking initialized");
     }
 
     private static void sendLODPayload(ServerPlayer player, LODDataPayload payload) {
@@ -108,7 +178,7 @@ public class NetworkHandler {
 
     public static void broadcastLODData(LevelChunk chunk) {
         ChunkPos pos = chunk.getPos();
-        int minY = chunk.getMinBuildHeight();
+        int minY = chunk.getMinSection();
         List<LODDataPayload.SectionData> sections = buildSections(chunk);
         if (sections.isEmpty()) return;
 
@@ -119,31 +189,49 @@ public class NetworkHandler {
             double dz = player.getZ() - (pos.getMiddleBlockZ());
 
             if (player.level() != chunk.getLevel() || (dx * dx + dz * dz > maxDistSq)) {
-                setSyncedState(player, pos, false);
+                PlayerTracker.getInstance().markUnsynced(player.getUUID(), chunk.getLevel().dimension(), pos);
                 continue;
             }
 
-            sendSectionsInBatches(player, chunk.getLevel().dimension(), pos, minY, sections);
+            sendLODData(player, chunk);
         }
     }
 
-    public static void sendLODData(ServerPlayer player, LevelChunk chunk) {
+    public static SendResult sendLODData(ServerPlayer player, LevelChunk chunk) {
         ChunkPos pos = chunk.getPos();
-        int minY = chunk.getMinBuildHeight();
+        int minY = chunk.getMinSection();
+        ResourceKey<Level> dimension = chunk.getLevel().dimension();
+        PlayerTracker tracker = PlayerTracker.getInstance();
+
+        if (!tracker.isClientReady(player.getUUID(), dimension)) {
+            debugNotReady.incrementAndGet();
+            recordDebugPayload(null, 0);
+            return SendResult.notReadyResult();
+        }
+
         List<LODDataPayload.SectionData> sections = buildSections(chunk);
 
         if (sections.isEmpty()) {
-            setSyncedState(player, pos, false);
-            return;
+            tracker.markLodAck(player.getUUID(), dimension, pos);
+            return SendResult.empty();
         }
 
-        sendSectionsInBatches(player, chunk.getLevel().dimension(), pos, minY, sections);
-        setSyncedState(player, pos, true);
+        long bytes = estimatePayloadBytes(sections);
+        long currentTick = player.server.getTickCount();
+        if (!tracker.tryReserveSyncBytes(player.getUUID(), bytes, currentTick)) {
+            debugThrottled.incrementAndGet();
+            recordDebugPayload(null, 0);
+            return SendResult.throttled(bytes);
+        }
+
+        sendSectionsInBatches(player, dimension, pos, minY, sections);
+        tracker.markLodSent(player.getUUID(), dimension, pos, currentTick);
+        return SendResult.sent(bytes);
     }
 
     private static List<LODDataPayload.SectionData> buildSections(LevelChunk chunk) {
         ChunkPos pos = chunk.getPos();
-        int minY = chunk.getMinBuildHeight();
+        int minY = chunk.getMinSection();
         List<LODDataPayload.SectionData> sections = new ArrayList<>();
         var lightEngine = chunk.getLevel().getLightEngine();
 
@@ -169,12 +257,13 @@ public class NetworkHandler {
                 biomesRaw.release();
             }
 
-            SectionPos sectionPos = SectionPos.of(pos, minY + i);
+            int sectionY = minY + i;
+            SectionPos sectionPos = SectionPos.of(pos, sectionY);
             DataLayer bl = lightEngine.getLayerListener(LightLayer.BLOCK).getDataLayerData(sectionPos);
             DataLayer sl = lightEngine.getLayerListener(LightLayer.SKY).getDataLayerData(sectionPos);
 
             sections.add(new LODDataPayload.SectionData(
-                minY + i,
+                sectionY,
                 states,
                 biomes,
                 bl != null ? bl.getData().clone() : null,
@@ -183,6 +272,17 @@ public class NetworkHandler {
         }
 
         return sections;
+    }
+
+    private static long estimatePayloadBytes(List<LODDataPayload.SectionData> sections) {
+        long bytes = 0L;
+        for (LODDataPayload.SectionData sd : sections) {
+            bytes += sd.states().length + sd.biomes().length;
+            if (sd.blockLight() != null) bytes += sd.blockLight().length;
+            if (sd.skyLight() != null) bytes += sd.skyLight().length;
+            bytes += 64L;
+        }
+        return bytes;
     }
 
     private static void sendSectionsInBatches(ServerPlayer player, ResourceKey<Level> dimension, ChunkPos pos, int minY, List<LODDataPayload.SectionData> sections) {
@@ -214,9 +314,38 @@ public class NetworkHandler {
         try {
             FriendlyByteBuf outFb = new FriendlyByteBuf(outRaw);
             payload.write(outFb);
+            recordDebugPayload(payload, outFb.readableBytes());
             ServerPlayNetworking.send(player, LOD_DATA_ID, new FriendlyByteBuf(outRaw.retainedDuplicate()));
         } finally {
             outRaw.release();
+        }
+    }
+
+    private static void recordDebugPayload(LODDataPayload payload, int bytes) {
+        if (!Config.DATA.debugSync) return;
+
+        if (payload != null) {
+            debugPayloadsSent.incrementAndGet();
+            debugSectionsSent.addAndGet(payload.sections().size());
+            debugBytesSent.addAndGet(bytes);
+        }
+
+        long now = System.currentTimeMillis();
+        if (now < nextDebugLogAtMs) return;
+        synchronized (NetworkHandler.class) {
+            if (now < nextDebugLogAtMs) return;
+            nextDebugLogAtMs = now + DEBUG_LOG_INTERVAL_MS;
+            VoxyWorldGenV2.LOGGER.info(
+                "voxy sync network: payloads={}, sections={}, bytes={}, ready={}, acks={}, throttled={}, notReady={}, lastChunk={}",
+                debugPayloadsSent.getAndSet(0),
+                debugSectionsSent.getAndSet(0),
+                debugBytesSent.getAndSet(0),
+                debugReadyReceived.getAndSet(0),
+                debugAcksReceived.getAndSet(0),
+                debugThrottled.getAndSet(0),
+                debugNotReady.getAndSet(0),
+                payload != null ? payload.pos() : "none"
+            );
         }
     }
 

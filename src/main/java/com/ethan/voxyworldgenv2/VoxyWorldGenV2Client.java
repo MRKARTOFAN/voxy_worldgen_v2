@@ -2,6 +2,7 @@ package com.ethan.voxyworldgenv2;
 
 import com.ethan.voxyworldgenv2.client.DebugRenderer;
 import com.ethan.voxyworldgenv2.core.ChunkGenerationManager;
+import com.ethan.voxyworldgenv2.core.Config;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -14,6 +15,7 @@ public class VoxyWorldGenV2Client implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         VoxyWorldGenV2.LOGGER.info("initializing voxy world gen v2 client");
+        Config.load();
         
         // debug hud renderer
         HudRenderCallback.EVENT.register(DebugRenderer::render);
@@ -30,11 +32,13 @@ public class VoxyWorldGenV2Client implements ClientModInitializer {
         // reset connection state on disconnect
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             com.ethan.voxyworldgenv2.network.NetworkState.setServerConnected(false);
+            com.ethan.voxyworldgenv2.network.NetworkClientHandler.clearSessionState();
         });
         
         // tick network stats
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(client -> {
             com.ethan.voxyworldgenv2.network.NetworkState.tick();
+            com.ethan.voxyworldgenv2.network.NetworkClientHandler.tick(client);
         });
     }
 }
