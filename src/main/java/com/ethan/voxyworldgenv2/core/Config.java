@@ -44,7 +44,16 @@ public final class Config {
         if (DATA.maxQueueSize <= 0) DATA.maxQueueSize = 20000;
         if (DATA.maxActiveTasks <= 0) DATA.maxActiveTasks = 20;
         if (DATA.update_interval <= 0) DATA.update_interval = 20;
-        if (DATA.syncBytesPerSecond <= 0) DATA.syncBytesPerSecond = 8L * 1024L * 1024L;
+        if (DATA.syncEnabled == null) DATA.syncEnabled = true;
+        if (DATA.syncChunksPerSecond <= 0) DATA.syncChunksPerSecond = 25;
+        if (DATA.syncGlobalChunksPerSecond <= 0) DATA.syncGlobalChunksPerSecond = 35;
+        if (DATA.syncBytesPerSecond <= 0) DATA.syncBytesPerSecond = 1L * 1024L * 1024L;
+        if (DATA.syncMaxDispatchPerLoop <= 0) DATA.syncMaxDispatchPerLoop = 2;
+        if (DATA.syncMaxLoadsInFlight <= 0) DATA.syncMaxLoadsInFlight = 4;
+        if (DATA.syncMinTps <= 0.0) DATA.syncMinTps = 18.0;
+        if (DATA.syncResumeTps <= 0.0) DATA.syncResumeTps = 19.0;
+        if (DATA.syncResumeTps < DATA.syncMinTps) DATA.syncResumeTps = DATA.syncMinTps;
+        if (DATA.syncThrottleCooldownTicks <= 0) DATA.syncThrottleCooldownTicks = 100;
         if (DATA.syncAckTimeoutTicks <= 0) DATA.syncAckTimeoutTicks = 200;
         if (DATA.clientDeferredMaxBytes <= 0) DATA.clientDeferredMaxBytes = 256L * 1024L * 1024L;
         if (DATA.clientDeferredMaxPayloads <= 0) DATA.clientDeferredMaxPayloads = 10000;
@@ -71,7 +80,15 @@ public final class Config {
         public int update_interval = 20; // legacy field for Compat
         public int maxQueueSize = 20000;
         public int maxActiveTasks = 20;
-        public long syncBytesPerSecond = 8L * 1024L * 1024L;
+        public Boolean syncEnabled = true;
+        public int syncChunksPerSecond = 25;
+        public int syncGlobalChunksPerSecond = 35;
+        public long syncBytesPerSecond = 1L * 1024L * 1024L;
+        public int syncMaxDispatchPerLoop = 2;
+        public int syncMaxLoadsInFlight = 4;
+        public double syncMinTps = 18.0;
+        public double syncResumeTps = 19.0;
+        public int syncThrottleCooldownTicks = 100;
         public int syncAckTimeoutTicks = 200;
         public long clientDeferredMaxBytes = 256L * 1024L * 1024L;
         public int clientDeferredMaxPayloads = 10000;

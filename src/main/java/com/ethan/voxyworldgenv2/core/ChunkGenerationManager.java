@@ -37,8 +37,6 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class ChunkGenerationManager {
     private static final ChunkGenerationManager INSTANCE = new ChunkGenerationManager();
-    private static final int MAX_SYNC_DISPATCH_PER_LOOP = 8;
-    private static final int MAX_SYNC_LOADS_IN_FLIGHT = 16;
     private static final long DEBUG_LOG_INTERVAL_MS = 5_000L;
     
     private static class DimensionState {
@@ -96,7 +94,10 @@ public final class ChunkGenerationManager {
     private final AtomicLong debugSyncSkippedNotReady = new AtomicLong();
     private final AtomicLong debugSyncThrottled = new AtomicLong();
     private final AtomicLong debugSyncExpiredInFlight = new AtomicLong();
+    private final AtomicLong debugSyncPausedTps = new AtomicLong();
+    private final AtomicLong debugSyncChunkBudgetThrottled = new AtomicLong();
     private volatile long nextSyncDebugLogAtMs = 0L;
+    private volatile long syncPausedUntilTick = 0L;
 
     private ChunkGenerationManager() {}
     
@@ -540,8 +541,21 @@ public final class ChunkGenerationManager {
     }
 
     private boolean processCompletedSyncForPlayers(MinecraftServer targetServer, List<ServerPlayer> players) {
+        if (!Boolean.TRUE.equals(Config.DATA.syncEnabled)) {
+            maybeLogSyncDebug();
+            return false;
+        }
+
+        if (isCompletedSyncPausedForTps(targetServer)) {
+            debugSyncPausedTps.incrementAndGet();
+            maybeLogSyncDebug();
+            return false;
+        }
+
         boolean workDispatched = false;
         int dispatchedThisLoop = 0;
+        int maxDispatchPerLoop = Math.max(1, Config.DATA.syncMaxDispatchPerLoop);
+        int maxLoadsInFlight = Math.max(1, Config.DATA.syncMaxLoadsInFlight);
 
         syncLoop:
         for (ServerPlayer player : players) {
@@ -562,13 +576,17 @@ public final class ChunkGenerationManager {
             debugSyncCandidates.addAndGet(syncBatch.size());
 
             for (ChunkPos syncPos : syncBatch) {
-                if (dispatchedThisLoop >= MAX_SYNC_DISPATCH_PER_LOOP) {
+                if (dispatchedThisLoop >= maxDispatchPerLoop) {
                     debugSyncSkippedLimit.incrementAndGet();
                     break syncLoop;
                 }
-                if (syncLoadInFlight.get() >= MAX_SYNC_LOADS_IN_FLIGHT) {
+                if (syncLoadInFlight.get() >= maxLoadsInFlight) {
                     debugSyncSkippedLimit.incrementAndGet();
                     break syncLoop;
+                }
+                if (!tracker.tryReserveSyncChunk(player.getUUID(), targetServer.getTickCount())) {
+                    debugSyncChunkBudgetThrottled.incrementAndGet();
+                    break;
                 }
                 if (dispatchCompletedChunkSync(targetServer, player, ds.level, syncPos)) {
                     workDispatched = true;
@@ -579,6 +597,29 @@ public final class ChunkGenerationManager {
 
         maybeLogSyncDebug();
         return workDispatched;
+    }
+
+    private boolean isCompletedSyncPausedForTps(MinecraftServer targetServer) {
+        double minTps = Config.DATA.syncMinTps > 0.0 ? Config.DATA.syncMinTps : 18.0;
+        double resumeTps = Config.DATA.syncResumeTps > 0.0 ? Config.DATA.syncResumeTps : 19.0;
+        int cooldownTicks = Config.DATA.syncThrottleCooldownTicks > 0 ? Config.DATA.syncThrottleCooldownTicks : 100;
+        long currentTick = targetServer.getTickCount();
+        double estimatedTps = tpsMonitor.getEstimatedTps();
+
+        if (currentTick < syncPausedUntilTick) {
+            if (estimatedTps >= resumeTps) {
+                syncPausedUntilTick = 0L;
+                return false;
+            }
+            return true;
+        }
+
+        if (estimatedTps < minTps) {
+            syncPausedUntilTick = currentTick + cooldownTicks;
+            return true;
+        }
+
+        return false;
     }
 
     private boolean dispatchCompletedChunkSync(MinecraftServer targetServer, ServerPlayer player, ServerLevel level, ChunkPos pos) {
@@ -675,7 +716,7 @@ public final class ChunkGenerationManager {
             if (now < nextSyncDebugLogAtMs) return;
             nextSyncDebugLogAtMs = now + DEBUG_LOG_INTERVAL_MS;
             VoxyWorldGenV2.LOGGER.info(
-                "voxy sync server: candidates={}, dispatched={}, loadedSend={}, diskQueued={}, diskSuccess={}, diskFail={}, empty={}, throttled={}, notReady={}, expiredInFlight={}, skippedInFlight={}, skippedLimit={}, inFlight={}/{}",
+                "voxy sync server: candidates={}, dispatched={}, loadedSend={}, diskQueued={}, diskSuccess={}, diskFail={}, empty={}, throttled={}, notReady={}, expiredInFlight={}, skippedInFlight={}, skippedLimit={}, pausedTps={}, chunkBudgetThrottled={}, inFlight={}, inFlightLimit={}, dispatchLimit={}, tps={}, mspt={}",
                 debugSyncCandidates.getAndSet(0),
                 debugSyncDispatched.getAndSet(0),
                 debugSyncAlreadyLoaded.getAndSet(0),
@@ -688,8 +729,13 @@ public final class ChunkGenerationManager {
                 debugSyncExpiredInFlight.getAndSet(0),
                 debugSyncSkippedInFlight.getAndSet(0),
                 debugSyncSkippedLimit.getAndSet(0),
+                debugSyncPausedTps.getAndSet(0),
+                debugSyncChunkBudgetThrottled.getAndSet(0),
                 syncLoadInFlight.get(),
-                MAX_SYNC_LOADS_IN_FLIGHT
+                Math.max(1, Config.DATA.syncMaxLoadsInFlight),
+                Math.max(1, Config.DATA.syncMaxDispatchPerLoop),
+                String.format("%.2f", tpsMonitor.getEstimatedTps()),
+                String.format("%.2f", tpsMonitor.getAverageMspt())
             );
         }
     }

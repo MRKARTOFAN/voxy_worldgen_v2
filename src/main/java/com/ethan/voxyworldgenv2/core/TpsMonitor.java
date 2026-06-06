@@ -8,6 +8,8 @@ public class TpsMonitor {
     private int tickTimeIndex = 0;
     private long lastTickNanos = 0;
     private final AtomicBoolean throttled = new AtomicBoolean(false);
+    private volatile float averageMspt = 0.0f;
+    private volatile double estimatedTps = 20.0;
     
     // standard for high performance: 18 tps (55.5ms)
     // aggressively pause if server truly struggles
@@ -36,6 +38,8 @@ public class TpsMonitor {
         if (count > 0) {
             mspt = (float) (totalTickTime / count) / 1_000_000.0f;
         }
+        averageMspt = mspt;
+        estimatedTps = mspt > 0.0f ? Math.min(20.0, 1000.0 / mspt) : 20.0;
 
         if (mspt > MSPT_THRESHOLD) {
             throttled.set(true);
@@ -49,9 +53,19 @@ public class TpsMonitor {
         tickTimeIndex = 0;
         Arrays.fill(recentTickTimes, 0);
         throttled.set(false);
+        averageMspt = 0.0f;
+        estimatedTps = 20.0;
     }
 
     public boolean isThrottled() {
         return throttled.get();
+    }
+
+    public float getAverageMspt() {
+        return averageMspt;
+    }
+
+    public double getEstimatedTps() {
+        return estimatedTps;
     }
 }
