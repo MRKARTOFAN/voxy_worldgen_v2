@@ -96,6 +96,7 @@ public final class ChunkGenerationManager {
     private final AtomicLong debugSyncExpiredInFlight = new AtomicLong();
     private final AtomicLong debugSyncPausedTps = new AtomicLong();
     private final AtomicLong debugSyncChunkBudgetThrottled = new AtomicLong();
+    private final AtomicLong debugSyncSkippedUnloaded = new AtomicLong();
     private volatile long nextSyncDebugLogAtMs = 0L;
     private volatile long syncPausedUntilTick = 0L;
 
@@ -656,6 +657,12 @@ public final class ChunkGenerationManager {
                 return;
             }
 
+            if (!Boolean.TRUE.equals(Config.DATA.syncLoadUnloadedChunks)) {
+                debugSyncSkippedUnloaded.incrementAndGet();
+                finishCompletedChunkSync(key);
+                return;
+            }
+
             debugSyncDiskQueued.incrementAndGet();
             try {
                 cache.addRegionTicket(TicketType.FORCED, pos, 0, pos);
@@ -716,7 +723,7 @@ public final class ChunkGenerationManager {
             if (now < nextSyncDebugLogAtMs) return;
             nextSyncDebugLogAtMs = now + DEBUG_LOG_INTERVAL_MS;
             VoxyWorldGenV2.LOGGER.info(
-                "voxy sync server: candidates={}, dispatched={}, loadedSend={}, diskQueued={}, diskSuccess={}, diskFail={}, empty={}, throttled={}, notReady={}, expiredInFlight={}, skippedInFlight={}, skippedLimit={}, pausedTps={}, chunkBudgetThrottled={}, inFlight={}, inFlightLimit={}, dispatchLimit={}, tps={}, mspt={}",
+                "voxy sync server: candidates={}, dispatched={}, loadedSend={}, diskQueued={}, diskSuccess={}, diskFail={}, empty={}, throttled={}, notReady={}, expiredInFlight={}, skippedInFlight={}, skippedLimit={}, pausedTps={}, chunkBudgetThrottled={}, skippedUnloaded={}, inFlight={}, inFlightLimit={}, dispatchLimit={}, tps={}, mspt={}",
                 debugSyncCandidates.getAndSet(0),
                 debugSyncDispatched.getAndSet(0),
                 debugSyncAlreadyLoaded.getAndSet(0),
@@ -731,6 +738,7 @@ public final class ChunkGenerationManager {
                 debugSyncSkippedLimit.getAndSet(0),
                 debugSyncPausedTps.getAndSet(0),
                 debugSyncChunkBudgetThrottled.getAndSet(0),
+                debugSyncSkippedUnloaded.getAndSet(0),
                 syncLoadInFlight.get(),
                 Math.max(1, Config.DATA.syncMaxLoadsInFlight),
                 Math.max(1, Config.DATA.syncMaxDispatchPerLoop),

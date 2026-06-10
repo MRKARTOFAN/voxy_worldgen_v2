@@ -50,6 +50,7 @@ public final class Config {
         if (DATA.syncBytesPerSecond <= 0) DATA.syncBytesPerSecond = 1L * 1024L * 1024L;
         if (DATA.syncMaxDispatchPerLoop <= 0) DATA.syncMaxDispatchPerLoop = 2;
         if (DATA.syncMaxLoadsInFlight <= 0) DATA.syncMaxLoadsInFlight = 4;
+        if (DATA.syncLoadUnloadedChunks == null) DATA.syncLoadUnloadedChunks = false;
         if (DATA.syncMinTps <= 0.0) DATA.syncMinTps = 18.0;
         if (DATA.syncResumeTps <= 0.0) DATA.syncResumeTps = 19.0;
         if (DATA.syncResumeTps < DATA.syncMinTps) DATA.syncResumeTps = DATA.syncMinTps;
@@ -59,6 +60,9 @@ public final class Config {
         if (DATA.clientDeferredMaxPayloads <= 0) DATA.clientDeferredMaxPayloads = 10000;
         if (DATA.clientDeferredFlushBytesPerTick <= 0) DATA.clientDeferredFlushBytesPerTick = 2L * 1024L * 1024L;
         if (DATA.clientDeferredFlushPayloadsPerTick <= 0) DATA.clientDeferredFlushPayloadsPerTick = 128;
+        if (DATA.clientKnownIndexEnabled == null) DATA.clientKnownIndexEnabled = true;
+        if (DATA.clientKnownRegionRadius <= 0) DATA.clientKnownRegionRadius = 10;
+        if (DATA.clientKnownRegionsPerTick <= 0) DATA.clientKnownRegionsPerTick = 16;
     }
     
     public static void save() {
@@ -86,6 +90,7 @@ public final class Config {
         public long syncBytesPerSecond = 1L * 1024L * 1024L;
         public int syncMaxDispatchPerLoop = 2;
         public int syncMaxLoadsInFlight = 4;
+        public Boolean syncLoadUnloadedChunks = false;
         public double syncMinTps = 18.0;
         public double syncResumeTps = 19.0;
         public int syncThrottleCooldownTicks = 100;
@@ -94,5 +99,8 @@ public final class Config {
         public int clientDeferredMaxPayloads = 10000;
         public long clientDeferredFlushBytesPerTick = 2L * 1024L * 1024L;
         public int clientDeferredFlushPayloadsPerTick = 128;
+        public Boolean clientKnownIndexEnabled = true;
+        public int clientKnownRegionRadius = 10;
+        public int clientKnownRegionsPerTick = 16;
     }
 }

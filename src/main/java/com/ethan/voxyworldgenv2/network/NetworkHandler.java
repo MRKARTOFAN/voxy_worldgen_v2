@@ -26,10 +26,12 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class NetworkHandler {
+    public static final int PROTOCOL_VERSION = 2;
     public static final ResourceLocation HANDSHAKE_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "handshake"));
     public static final ResourceLocation LOD_DATA_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "lod_data"));
     public static final ResourceLocation CLIENT_READY_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "client_ready"));
     public static final ResourceLocation LOD_ACK_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "lod_ack"));
+    public static final ResourceLocation KNOWN_LOD_REGIONS_ID = Objects.requireNonNull(ResourceLocation.tryBuild(VoxyWorldGenV2.MOD_ID, "known_lod_regions"));
 
     // keep individual packets well under Netty's 2MB limit to prevent connection resets on public servers
     private static final int MAX_PACKET_BYTES = 32_768;
@@ -39,21 +41,24 @@ public class NetworkHandler {
     private static final AtomicLong debugBytesSent = new AtomicLong();
     private static final AtomicLong debugAcksReceived = new AtomicLong();
     private static final AtomicLong debugReadyReceived = new AtomicLong();
+    private static final AtomicLong debugKnownRegionsReceived = new AtomicLong();
+    private static final AtomicLong debugKnownChunksReceived = new AtomicLong();
     private static final AtomicLong debugThrottled = new AtomicLong();
     private static final AtomicLong debugNotReady = new AtomicLong();
     private static volatile long nextDebugLogAtMs = 0L;
 
-    public record HandshakePayload(boolean serverHasMod) {
+    public record HandshakePayload(int protocolVersion, boolean serverHasMod) {
         public HandshakePayload(FriendlyByteBuf buf) {
-            this(buf.readBoolean());
+            this(buf.readVarInt(), buf.readBoolean());
         }
 
         public void write(FriendlyByteBuf buf) {
+            buf.writeVarInt(this.protocolVersion);
             buf.writeBoolean(this.serverHasMod);
         }
     }
 
-    public record LODDataPayload(ResourceKey<Level> dimension, ChunkPos pos, int minY, List<SectionData> sections) {
+    public record LODDataPayload(ResourceKey<Level> dimension, ChunkPos pos, int minY, long fullSectionMask, long batchSectionMask, List<SectionData> sections) {
 
         public record SectionData(int y, byte[] states, byte[] biomes, byte[] blockLight, byte[] skyLight) {
             public void write(FriendlyByteBuf buf) {
@@ -79,6 +84,8 @@ public class NetworkHandler {
                 ResourceKey.create(Registries.DIMENSION, Objects.requireNonNull(ResourceLocation.tryParse(buf.readUtf()), "invalid dimension resource location in LOD payload")),
                 buf.readChunkPos(),
                 buf.readInt(),
+                buf.readLong(),
+                buf.readLong(),
                 buf.readCollection(ArrayList::new, b -> SectionData.read((FriendlyByteBuf) b))
             );
         }
@@ -87,6 +94,8 @@ public class NetworkHandler {
             buf.writeUtf(dimension.location().toString());
             buf.writeChunkPos(pos);
             buf.writeInt(minY);
+            buf.writeLong(fullSectionMask);
+            buf.writeLong(batchSectionMask);
             // cast to avoid ambiguous writeCollection / BiConsumer type issues
             buf.writeCollection(sections, (b, s) -> s.write((FriendlyByteBuf) b));
         }
@@ -114,6 +123,40 @@ public class NetworkHandler {
         public void write(FriendlyByteBuf buf) {
             buf.writeUtf(dimension.location().toString());
             buf.writeChunkPos(pos);
+        }
+    }
+
+    public record KnownLODRegionsPayload(ResourceKey<Level> dimension, List<RegionData> regions) {
+        public record RegionData(int regionX, int regionZ, long[] maskWords) {
+            public void write(FriendlyByteBuf buf) {
+                buf.writeInt(regionX);
+                buf.writeInt(regionZ);
+                for (int i = 0; i < 16; i++) {
+                    buf.writeLong(maskWords != null && i < maskWords.length ? maskWords[i] : 0L);
+                }
+            }
+
+            public static RegionData read(FriendlyByteBuf buf) {
+                long[] maskWords = new long[16];
+                int regionX = buf.readInt();
+                int regionZ = buf.readInt();
+                for (int i = 0; i < maskWords.length; i++) {
+                    maskWords[i] = buf.readLong();
+                }
+                return new RegionData(regionX, regionZ, maskWords);
+            }
+        }
+
+        public KnownLODRegionsPayload(FriendlyByteBuf buf) {
+            this(
+                ResourceKey.create(Registries.DIMENSION, Objects.requireNonNull(ResourceLocation.tryParse(buf.readUtf()), "invalid dimension resource location in known-region payload")),
+                buf.readCollection(ArrayList::new, b -> RegionData.read((FriendlyByteBuf) b))
+            );
+        }
+
+        public void write(FriendlyByteBuf buf) {
+            buf.writeUtf(dimension.location().toString());
+            buf.writeCollection(regions, (b, r) -> r.write((FriendlyByteBuf) b));
         }
     }
 
@@ -159,6 +202,23 @@ public class NetworkHandler {
                 });
             } catch (Exception e) {
                 VoxyWorldGenV2.LOGGER.error("failed to decode LOD ack payload", e);
+            }
+        });
+
+        ServerPlayNetworking.registerGlobalReceiver(KNOWN_LOD_REGIONS_ID, (server, player, handler, buf, responseSender) -> {
+            try {
+                KnownLODRegionsPayload payload = new KnownLODRegionsPayload(buf);
+                server.execute(() -> {
+                    int chunks = 0;
+                    for (KnownLODRegionsPayload.RegionData region : payload.regions()) {
+                        chunks += PlayerTracker.getInstance().markKnownRegion(player.getUUID(), payload.dimension(), region.regionX(), region.regionZ(), region.maskWords());
+                    }
+                    debugKnownRegionsReceived.addAndGet(payload.regions().size());
+                    debugKnownChunksReceived.addAndGet(chunks);
+                    recordDebugPayload(null, 0);
+                });
+            } catch (Exception e) {
+                VoxyWorldGenV2.LOGGER.error("failed to decode known LOD regions payload", e);
             }
         });
 
@@ -224,7 +284,7 @@ public class NetworkHandler {
             return SendResult.throttled(bytes);
         }
 
-        sendSectionsInBatches(player, dimension, pos, minY, sections);
+        sendSectionsInBatches(player, dimension, pos, minY, sections, sectionMask(sections, minY));
         tracker.markLodSent(player.getUUID(), dimension, pos, currentTick);
         return SendResult.sent(bytes);
     }
@@ -285,7 +345,18 @@ public class NetworkHandler {
         return bytes;
     }
 
-    private static void sendSectionsInBatches(ServerPlayer player, ResourceKey<Level> dimension, ChunkPos pos, int minY, List<LODDataPayload.SectionData> sections) {
+    private static long sectionMask(List<LODDataPayload.SectionData> sections, int minY) {
+        long mask = 0L;
+        for (LODDataPayload.SectionData section : sections) {
+            int bit = section.y() - minY;
+            if (bit >= 0 && bit < Long.SIZE) {
+                mask |= 1L << bit;
+            }
+        }
+        return mask;
+    }
+
+    private static void sendSectionsInBatches(ServerPlayer player, ResourceKey<Level> dimension, ChunkPos pos, int minY, List<LODDataPayload.SectionData> sections, long fullSectionMask) {
         List<LODDataPayload.SectionData> batch = new ArrayList<>();
         int batchBytes = 0;
 
@@ -295,7 +366,7 @@ public class NetworkHandler {
                 + (sd.skyLight() != null ? sd.skyLight().length : 0);
 
             if (!batch.isEmpty() && batchBytes + sectionBytes > MAX_PACKET_BYTES) {
-                sendLODDataPayload(player, new LODDataPayload(dimension, pos, minY, batch));
+                sendLODDataPayload(player, new LODDataPayload(dimension, pos, minY, fullSectionMask, sectionMask(batch, minY), batch));
                 batch = new ArrayList<>();
                 batchBytes = 0;
             }
@@ -305,7 +376,7 @@ public class NetworkHandler {
         }
 
         if (!batch.isEmpty()) {
-            sendLODDataPayload(player, new LODDataPayload(dimension, pos, minY, batch));
+            sendLODDataPayload(player, new LODDataPayload(dimension, pos, minY, fullSectionMask, sectionMask(batch, minY), batch));
         }
     }
 
@@ -336,12 +407,14 @@ public class NetworkHandler {
             if (now < nextDebugLogAtMs) return;
             nextDebugLogAtMs = now + DEBUG_LOG_INTERVAL_MS;
             VoxyWorldGenV2.LOGGER.info(
-                "voxy sync network: payloads={}, sections={}, bytes={}, ready={}, acks={}, throttled={}, notReady={}, lastChunk={}",
+                "voxy sync network: payloads={}, sections={}, bytes={}, ready={}, acks={}, knownRegions={}, knownChunks={}, throttled={}, notReady={}, lastChunk={}",
                 debugPayloadsSent.getAndSet(0),
                 debugSectionsSent.getAndSet(0),
                 debugBytesSent.getAndSet(0),
                 debugReadyReceived.getAndSet(0),
                 debugAcksReceived.getAndSet(0),
+                debugKnownRegionsReceived.getAndSet(0),
+                debugKnownChunksReceived.getAndSet(0),
                 debugThrottled.getAndSet(0),
                 debugNotReady.getAndSet(0),
                 payload != null ? payload.pos() : "none"
@@ -352,7 +425,8 @@ public class NetworkHandler {
     public static void sendHandshake(ServerPlayer player) {
         ByteBuf outRaw = Unpooled.buffer();
         try {
-            outRaw.writeBoolean(true);
+            FriendlyByteBuf outBuf = new FriendlyByteBuf(outRaw);
+            new HandshakePayload(PROTOCOL_VERSION, true).write(outBuf);
             ServerPlayNetworking.send(player, HANDSHAKE_ID, new FriendlyByteBuf(outRaw.retainedDuplicate()));
         } finally {
             outRaw.release();

@@ -19,7 +19,9 @@ import net.minecraft.world.level.Level;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,9 +31,56 @@ public class NetworkClientHandler {
     private static final long DEBUG_LOG_INTERVAL_MS = 5_000L;
     private static final Map<ResourceKey<Level>, ArrayDeque<DeferredPayload>> deferredPayloads = new ConcurrentHashMap<>();
     private static final Set<ResourceKey<Level>> readyDimensionsSent = new HashSet<>();
+    private static final Map<ResourceKey<Level>, KnownRegionCursor> knownRegionCursors = new ConcurrentHashMap<>();
+    private static final Map<ChunkSyncKey, Long> acceptedSectionMasks = new ConcurrentHashMap<>();
     private static long deferredBytes = 0L;
 
     private record DeferredPayload(NetworkHandler.LODDataPayload payload, long bytes, long queuedAtMs) {}
+    private record ChunkSyncKey(ResourceKey<Level> dimension, long chunkPos) {}
+
+    private static final class KnownRegionCursor {
+        private final ResourceKey<Level> dimension;
+        private final int centerRegionX;
+        private final int centerRegionZ;
+        private final int radius;
+        private int dx;
+        private int dz;
+        private boolean done;
+
+        private KnownRegionCursor(ResourceKey<Level> dimension, int centerRegionX, int centerRegionZ, int radius) {
+            this.dimension = dimension;
+            this.centerRegionX = centerRegionX;
+            this.centerRegionZ = centerRegionZ;
+            this.radius = radius;
+            this.dx = -radius;
+            this.dz = -radius;
+        }
+
+        private List<NetworkHandler.KnownLODRegionsPayload.RegionData> nextBatch(int maxRegions) {
+            List<NetworkHandler.KnownLODRegionsPayload.RegionData> batch = new ArrayList<>();
+            while (!done && batch.size() < maxRegions) {
+                int regionX = centerRegionX + dx;
+                int regionZ = centerRegionZ + dz;
+                long[] mask = ClientReceivedLodIndex.getRegionMask(dimension, regionX, regionZ);
+                if (mask != null) {
+                    batch.add(new NetworkHandler.KnownLODRegionsPayload.RegionData(regionX, regionZ, mask));
+                }
+                advance();
+            }
+            return batch;
+        }
+
+        private void advance() {
+            dz++;
+            if (dz > radius) {
+                dz = -radius;
+                dx++;
+            }
+            if (dx > radius) {
+                done = true;
+            }
+        }
+    }
 
     private static final AtomicLong debugPayloads = new AtomicLong();
     private static final AtomicLong debugSections = new AtomicLong();
@@ -51,13 +100,25 @@ public class NetworkClientHandler {
     private static final AtomicLong debugDeferredDropped = new AtomicLong();
     private static final AtomicLong debugAcksSent = new AtomicLong();
     private static final AtomicLong debugReadySent = new AtomicLong();
+    private static final AtomicLong debugKnownRegionsSent = new AtomicLong();
+    private static final AtomicLong debugKnownChunksAdvertised = new AtomicLong();
+    private static final AtomicLong debugIndexWrites = new AtomicLong();
     private static volatile long nextDebugLogAtMs = 0L;
     
     public static void init() {
         ClientPlayNetworking.registerGlobalReceiver(NetworkHandler.HANDSHAKE_ID, (client, networkHandler, buf, responseSender) -> {
             try {
                 NetworkHandler.HandshakePayload payload = new NetworkHandler.HandshakePayload(buf);
-                client.execute(() -> NetworkState.setServerConnected(payload.serverHasMod()));
+                client.execute(() -> {
+                    boolean connected = payload.serverHasMod() && payload.protocolVersion() == NetworkHandler.PROTOCOL_VERSION;
+                    if (payload.serverHasMod() && payload.protocolVersion() != NetworkHandler.PROTOCOL_VERSION) {
+                        VoxyWorldGenV2.LOGGER.warn("voxy sync protocol mismatch: client={}, server={}", NetworkHandler.PROTOCOL_VERSION, payload.protocolVersion());
+                    }
+                    NetworkState.setServerConnected(connected);
+                    if (connected) {
+                        ClientReceivedLodIndex.configureForCurrentServer();
+                    }
+                });
             } catch (Exception e) {
                 VoxyWorldGenV2.LOGGER.error("failed to decode handshake payload", e);
             }
@@ -97,6 +158,11 @@ public class NetworkClientHandler {
         if (level == null) return;
 
         if (NetworkState.isServerConnected() && ClientVoxyDirectIngester.isRendererReady(level)) {
+            ClientReceivedLodIndex.tickFlush();
+            if (Boolean.TRUE.equals(Config.DATA.clientKnownIndexEnabled) && !sendKnownRegions(level)) {
+                flushDeferred(level);
+                return;
+            }
             sendClientReady(level.dimension());
             flushDeferred(level);
         }
@@ -106,8 +172,11 @@ public class NetworkClientHandler {
         synchronized (NetworkClientHandler.class) {
             deferredPayloads.clear();
             readyDimensionsSent.clear();
+            knownRegionCursors.clear();
+            acceptedSectionMasks.clear();
             deferredBytes = 0L;
         }
+        ClientReceivedLodIndex.flushDirty();
     }
 
     private static void flushDeferred(ClientLevel level) {
@@ -166,6 +235,7 @@ public class NetworkClientHandler {
         long directFailCount = 0;
         long rendererMissingCount = 0;
         long rawFallbackCount = 0;
+        long acceptedMask = 0L;
 
         for (NetworkHandler.LODDataPayload.SectionData sectionData : payload.sections()) {
             ByteBuf statesRaw = Unpooled.wrappedBuffer(sectionData.states());
@@ -205,6 +275,10 @@ public class NetworkClientHandler {
                 ingestCount++;
                 if (accepted) {
                     ingestAcceptedCount++;
+                    int bit = sectionData.y() - payload.minY();
+                    if (bit >= 0 && bit < Long.SIZE) {
+                        acceptedMask |= 1L << bit;
+                    }
                 } else {
                     ingestRejectedCount++;
                 }
@@ -219,8 +293,20 @@ public class NetworkClientHandler {
 
         recordDebugPayload(payload, bytes, airBeforeCount, airAfterCount, ingestCount, ingestAcceptedCount, ingestRejectedCount, directAttemptCount, directSuccessCount, directFailCount, rendererMissingCount, rawFallbackCount);
         if (rendererMissingCount > 0) return false;
-        if (ingestAcceptedCount > 0) sendAck(payload);
+        if (acceptedMask != 0L) markAcceptedAndMaybeAck(payload, acceptedMask);
         return true;
+    }
+
+    private static void markAcceptedAndMaybeAck(NetworkHandler.LODDataPayload payload, long acceptedMask) {
+        ChunkSyncKey key = new ChunkSyncKey(payload.dimension(), payload.pos().toLong());
+        long mergedMask = acceptedSectionMasks.merge(key, acceptedMask, (existing, update) -> existing | update);
+        long fullMask = payload.fullSectionMask() != 0L ? payload.fullSectionMask() : payload.batchSectionMask();
+        if ((mergedMask & fullMask) != fullMask) return;
+
+        acceptedSectionMasks.remove(key);
+        sendAck(payload);
+        ClientReceivedLodIndex.markReceived(payload.dimension(), payload.pos());
+        debugIndexWrites.incrementAndGet();
     }
 
     private static void enqueueDeferred(NetworkHandler.LODDataPayload payload, long bytes) {
@@ -271,6 +357,47 @@ public class NetworkClientHandler {
         }
     }
 
+    private static boolean sendKnownRegions(ClientLevel level) {
+        if (Minecraft.getInstance().player == null) return true;
+
+        int radius = Config.DATA.clientKnownRegionRadius > 0 ? Config.DATA.clientKnownRegionRadius : 10;
+        int perTick = Config.DATA.clientKnownRegionsPerTick > 0 ? Config.DATA.clientKnownRegionsPerTick : 16;
+        int centerRegionX = Math.floorDiv(Minecraft.getInstance().player.chunkPosition().x, 32);
+        int centerRegionZ = Math.floorDiv(Minecraft.getInstance().player.chunkPosition().z, 32);
+
+        KnownRegionCursor cursor = knownRegionCursors.computeIfAbsent(level.dimension(), ignored -> new KnownRegionCursor(level.dimension(), centerRegionX, centerRegionZ, radius));
+        if (cursor.done) return true;
+
+        List<NetworkHandler.KnownLODRegionsPayload.RegionData> batch = cursor.nextBatch(perTick);
+        if (!batch.isEmpty()) {
+            sendKnownRegionsPayload(level.dimension(), batch);
+        }
+        return cursor.done;
+    }
+
+    private static void sendKnownRegionsPayload(ResourceKey<Level> dimension, List<NetworkHandler.KnownLODRegionsPayload.RegionData> regions) {
+        ByteBuf outRaw = Unpooled.buffer();
+        try {
+            FriendlyByteBuf outBuf = new FriendlyByteBuf(outRaw);
+            new NetworkHandler.KnownLODRegionsPayload(dimension, regions).write(outBuf);
+            ClientPlayNetworking.send(NetworkHandler.KNOWN_LOD_REGIONS_ID, new FriendlyByteBuf(outRaw.retainedDuplicate()));
+            debugKnownRegionsSent.addAndGet(regions.size());
+            debugKnownChunksAdvertised.addAndGet(countKnownChunks(regions));
+        } finally {
+            outRaw.release();
+        }
+    }
+
+    private static long countKnownChunks(List<NetworkHandler.KnownLODRegionsPayload.RegionData> regions) {
+        long count = 0L;
+        for (NetworkHandler.KnownLODRegionsPayload.RegionData region : regions) {
+            for (long word : region.maskWords()) {
+                count += Long.bitCount(word);
+            }
+        }
+        return count;
+    }
+
     private static void sendAck(NetworkHandler.LODDataPayload payload) {
         ByteBuf outRaw = Unpooled.buffer();
         try {
@@ -306,7 +433,7 @@ public class NetworkClientHandler {
             if (now < nextDebugLogAtMs) return;
             nextDebugLogAtMs = now + DEBUG_LOG_INTERVAL_MS;
             VoxyWorldGenV2.LOGGER.info(
-                "voxy sync client: payloads={}, sections={}, bytes={}, airBefore={}, airAfter={}, ingest={}, accepted={}, rejected={}, directAttempt={}, directSuccess={}, directFail={}, rendererMissing={}, rawFallback={}, deferredQueued={}, deferredFlushed={}, deferredDropped={}, queueBytes={}, readySent={}, acksSent={}, dim={}, lastChunk={}",
+                "voxy sync client: payloads={}, sections={}, bytes={}, airBefore={}, airAfter={}, ingest={}, accepted={}, rejected={}, directAttempt={}, directSuccess={}, directFail={}, rendererMissing={}, rawFallback={}, deferredQueued={}, deferredFlushed={}, deferredDropped={}, queueBytes={}, readySent={}, acksSent={}, knownRegionsSent={}, knownChunksAdvertised={}, indexWrites={}, dim={}, lastChunk={}",
                 debugPayloads.getAndSet(0),
                 debugSections.getAndSet(0),
                 debugBytes.getAndSet(0),
@@ -326,6 +453,9 @@ public class NetworkClientHandler {
                 deferredBytes,
                 debugReadySent.getAndSet(0),
                 debugAcksSent.getAndSet(0),
+                debugKnownRegionsSent.getAndSet(0),
+                debugKnownChunksAdvertised.getAndSet(0),
+                debugIndexWrites.getAndSet(0),
                 payload.dimension().location(),
                 payload.pos()
             );

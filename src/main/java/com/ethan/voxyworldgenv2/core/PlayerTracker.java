@@ -125,6 +125,34 @@ public class PlayerTracker {
         if (synced != null) synced.add(pos.toLong());
     }
 
+    public int markKnownRegion(UUID uuid, ResourceKey<Level> dimension, int regionX, int regionZ, long[] maskWords) {
+        LongSet synced = getSyncedChunks(uuid, dimension);
+        if (synced == null || maskWords == null) return 0;
+
+        int added = 0;
+        synchronized (synced) {
+            for (int wordIndex = 0; wordIndex < maskWords.length; wordIndex++) {
+                long word = maskWords[wordIndex];
+                while (word != 0L) {
+                    int bit = Long.numberOfTrailingZeros(word);
+                    int localIndex = (wordIndex * Long.SIZE) + bit;
+                    if (localIndex >= 1024) break;
+
+                    int localX = localIndex & 31;
+                    int localZ = localIndex >> 5;
+                    int chunkX = (regionX << 5) + localX;
+                    int chunkZ = (regionZ << 5) + localZ;
+                    if (synced.add(new ChunkPos(chunkX, chunkZ).toLong())) {
+                        added++;
+                    }
+
+                    word &= ~(1L << bit);
+                }
+            }
+        }
+        return added;
+    }
+
     public void markUnsynced(UUID uuid, ResourceKey<Level> dimension, ChunkPos pos) {
         LongSet synced = getSyncedChunks(uuid, dimension);
         if (synced != null) synced.remove(pos.toLong());
